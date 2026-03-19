@@ -5,28 +5,31 @@ import { monitorSingleAccount } from "./monitor.account.js";
 import { setFeishuRuntime } from "./runtime.js";
 import type { ResolvedFeishuAccount } from "./types.js";
 
+type BoundConversation = {
+  bindingId: string;
+  targetSessionKey: string;
+};
+
 const createEventDispatcherMock = vi.hoisted(() => vi.fn());
 const monitorWebSocketMock = vi.hoisted(() => vi.fn(async () => {}));
 const monitorWebhookMock = vi.hoisted(() => vi.fn(async () => {}));
 const createFeishuThreadBindingManagerMock = vi.hoisted(() => vi.fn(() => ({ stop: vi.fn() })));
 const createFeishuReplyDispatcherMock = vi.hoisted(() => vi.fn());
 const resolveBoundConversationMock = vi.hoisted(() =>
-  vi.fn<
-    () => {
-      bindingId: string;
-      targetSessionKey: string;
-    } | null
-  >(() => null),
+  vi.fn<() => BoundConversation | null>(() => null),
 );
 const touchBindingMock = vi.hoisted(() => vi.fn());
 const resolveAgentRouteMock = vi.hoisted(() => vi.fn());
 const dispatchReplyFromConfigMock = vi.hoisted(() => vi.fn());
 const withReplyDispatcherMock = vi.hoisted(() => vi.fn());
 const finalizeInboundContextMock = vi.hoisted(() => vi.fn((ctx) => ctx));
+const sendCardFeishuMock = vi.hoisted(() =>
+  vi.fn(async () => ({ messageId: "om_card_sent", chatId: "p2p:ou_user1" })),
+);
 const getMessageFeishuMock = vi.hoisted(() => vi.fn(async () => null));
 const listFeishuThreadMessagesMock = vi.hoisted(() => vi.fn(async () => []));
 const sendMessageFeishuMock = vi.hoisted(() =>
-  vi.fn(async () => ({ messageId: "om_sent", chatId: "oc_group_1" })),
+  vi.fn(async () => ({ messageId: "om_sent", chatId: "p2p:ou_user1" })),
 );
 
 let handlers: Record<string, (data: unknown) => Promise<void>> = {};
@@ -55,6 +58,7 @@ vi.mock("./reply-dispatcher.js", () => ({
 }));
 
 vi.mock("./send.js", () => ({
+  sendCardFeishu: sendCardFeishuMock,
   getMessageFeishu: getMessageFeishuMock,
   listFeishuThreadMessages: listFeishuThreadMessagesMock,
   sendMessageFeishu: sendMessageFeishuMock,
@@ -80,6 +84,25 @@ vi.mock("../../../src/infra/outbound/session-binding-service.js", () => ({
 
 function createLifecycleConfig(): ClawdbotConfig {
   return {
+    channels: {
+      feishu: {
+        enabled: true,
+        dmPolicy: "open",
+        requireMention: false,
+        resolveSenderNames: false,
+        accounts: {
+          "acct-menu": {
+            enabled: true,
+            appId: "cli_test",
+            appSecret: "secret_test", // pragma: allowlist secret
+            connectionMode: "websocket",
+            dmPolicy: "open",
+            requireMention: false,
+            resolveSenderNames: false,
+          },
+        },
+      },
+    },
     messages: {
       inbound: {
         debounceMs: 0,
@@ -88,35 +111,12 @@ function createLifecycleConfig(): ClawdbotConfig {
         },
       },
     },
-    channels: {
-      feishu: {
-        enabled: true,
-        accounts: {
-          "acct-lifecycle": {
-            enabled: true,
-            appId: "cli_test",
-            appSecret: "secret_test", // pragma: allowlist secret
-            connectionMode: "websocket",
-            groupPolicy: "open",
-            requireMention: false,
-            resolveSenderNames: false,
-            groups: {
-              oc_group_1: {
-                requireMention: false,
-                groupSessionScope: "group_topic_sender",
-                replyInThread: "enabled",
-              },
-            },
-          },
-        },
-      },
-    },
   } as ClawdbotConfig;
 }
 
 function createLifecycleAccount(): ResolvedFeishuAccount {
   return {
-    accountId: "acct-lifecycle",
+    accountId: "acct-menu",
     selectionSource: "explicit",
     enabled: true,
     configured: true,
@@ -126,16 +126,9 @@ function createLifecycleAccount(): ResolvedFeishuAccount {
     config: {
       enabled: true,
       connectionMode: "websocket",
-      groupPolicy: "open",
+      dmPolicy: "open",
       requireMention: false,
       resolveSenderNames: false,
-      groups: {
-        oc_group_1: {
-          requireMention: false,
-          groupSessionScope: "group_topic_sender",
-          replyInThread: "enabled",
-        },
-      },
     },
   } as unknown as ResolvedFeishuAccount;
 }
@@ -148,21 +141,16 @@ function createRuntimeEnv(): RuntimeEnv {
   } as RuntimeEnv;
 }
 
-function createTextEvent(messageId: string) {
+function createBotMenuEvent(params: { eventKey: string; timestamp: string }) {
   return {
-    sender: {
-      sender_id: { open_id: "ou_sender_1" },
-      sender_type: "user",
-    },
-    message: {
-      message_id: messageId,
-      root_id: "om_root_topic_1",
-      thread_id: "omt_topic_1",
-      chat_id: "oc_group_1",
-      chat_type: "group" as const,
-      message_type: "text",
-      content: JSON.stringify({ text: "hello from topic" }),
-      create_time: "1710000000000",
+    event_key: params.eventKey,
+    timestamp: params.timestamp,
+    operator: {
+      operator_id: {
+        open_id: "ou_user1",
+        user_id: "user_1",
+        union_id: "union_1",
+      },
     },
   };
 }
@@ -193,19 +181,19 @@ async function setupLifecycleMonitor() {
     },
   });
 
-  const onMessage = handlers["im.message.receive_v1"];
-  if (!onMessage) {
-    throw new Error("missing im.message.receive_v1 handler");
+  const onBotMenu = handlers["application.bot.menu_v6"];
+  if (!onBotMenu) {
+    throw new Error("missing application.bot.menu_v6 handler");
   }
-  return onMessage;
+  return onBotMenu;
 }
 
-describe("Feishu reply-once lifecycle", () => {
+describe("Feishu bot-menu lifecycle", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     handlers = {};
     lastRuntime = null;
-    process.env.OPENCLAW_STATE_DIR = `/tmp/openclaw-feishu-lifecycle-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    process.env.OPENCLAW_STATE_DIR = `/tmp/openclaw-feishu-bot-menu-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     const dispatcher = {
       sendToolResult: vi.fn(() => false),
@@ -222,22 +210,22 @@ describe("Feishu reply-once lifecycle", () => {
       markDispatchIdle: vi.fn(),
     });
 
-    resolveBoundConversationMock.mockReturnValue({
-      bindingId: "binding-1",
-      targetSessionKey: "agent:bound-agent:feishu:topic:om_root_topic_1:ou_sender_1",
-    });
+    resolveBoundConversationMock.mockImplementation(() => ({
+      bindingId: "binding-menu",
+      targetSessionKey: "agent:bound-agent:feishu:direct:ou_user1",
+    }));
 
     resolveAgentRouteMock.mockReturnValue({
       agentId: "main",
       channel: "feishu",
-      accountId: "acct-lifecycle",
-      sessionKey: "agent:main:feishu:group:oc_group_1",
+      accountId: "acct-menu",
+      sessionKey: "agent:main:feishu:direct:ou_user1",
       mainSessionKey: "agent:main:main",
       matchedBy: "default",
     });
 
     dispatchReplyFromConfigMock.mockImplementation(async ({ dispatcher }) => {
-      await dispatcher.sendFinalReply({ text: "reply once" });
+      await dispatcher.sendFinalReply({ text: "menu reply once" });
       return {
         queuedFinal: false,
         counts: { final: 1 },
@@ -288,7 +276,7 @@ describe("Feishu reply-once lifecycle", () => {
           },
           session: {
             readSessionUpdatedAt: vi.fn(),
-            resolveStorePath: vi.fn(() => "/tmp/feishu-lifecycle-sessions.json"),
+            resolveStorePath: vi.fn(() => "/tmp/feishu-bot-menu-sessions.json"),
           },
           pairing: {
             readAllowFromStore: vi.fn().mockResolvedValue([]),
@@ -311,59 +299,63 @@ describe("Feishu reply-once lifecycle", () => {
     process.env.OPENCLAW_STATE_DIR = originalStateDir;
   });
 
-  it("routes a topic-bound inbound event and emits one reply across duplicate replay", async () => {
-    const onMessage = await setupLifecycleMonitor();
-    const event = createTextEvent("om_lifecycle_once");
+  it("opens one launcher card across duplicate quick-actions replay", async () => {
+    const onBotMenu = await setupLifecycleMonitor();
+    const event = createBotMenuEvent({
+      eventKey: "quick-actions",
+      timestamp: "1700000000000",
+    });
 
-    await onMessage(event);
+    await onBotMenu(event);
     await settleAsyncWork();
-    await onMessage(event);
+    await onBotMenu(event);
     await settleAsyncWork();
 
     expect(lastRuntime?.error).not.toHaveBeenCalled();
+    expect(sendCardFeishuMock).toHaveBeenCalledTimes(1);
+    expect(sendCardFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: "acct-menu",
+        to: "user:ou_user1",
+      }),
+    );
+    expect(dispatchReplyFromConfigMock).not.toHaveBeenCalled();
+    expect(createFeishuReplyDispatcherMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back once to the legacy routed reply path when launcher rendering fails", async () => {
+    const onBotMenu = await setupLifecycleMonitor();
+    const event = createBotMenuEvent({
+      eventKey: "quick-actions",
+      timestamp: "1700000000001",
+    });
+    sendCardFeishuMock.mockRejectedValueOnce(new Error("boom"));
+
+    await onBotMenu(event);
+    await settleAsyncWork();
+    await onBotMenu(event);
+    await settleAsyncWork();
+
+    expect(lastRuntime?.error).not.toHaveBeenCalled();
+    expect(sendCardFeishuMock).toHaveBeenCalledTimes(1);
     expect(dispatchReplyFromConfigMock).toHaveBeenCalledTimes(1);
     expect(createFeishuReplyDispatcherMock).toHaveBeenCalledTimes(1);
     expect(createFeishuReplyDispatcherMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        accountId: "acct-lifecycle",
-        chatId: "oc_group_1",
-        replyToMessageId: "om_root_topic_1",
-        replyInThread: true,
-        rootId: "om_root_topic_1",
+        accountId: "acct-menu",
+        chatId: "p2p:ou_user1",
+        replyToMessageId: "bot-menu:quick-actions:1700000000001",
       }),
     );
     expect(finalizeInboundContextMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        AccountId: "acct-lifecycle",
-        SessionKey: "agent:bound-agent:feishu:topic:om_root_topic_1:ou_sender_1",
-        MessageSid: "om_lifecycle_once",
-        MessageThreadId: "om_root_topic_1",
+        AccountId: "acct-menu",
+        SessionKey: "agent:bound-agent:feishu:direct:ou_user1",
+        MessageSid: "bot-menu:quick-actions:1700000000001",
       }),
     );
-    expect(touchBindingMock).toHaveBeenCalledWith("binding-1");
+    expect(touchBindingMock).toHaveBeenCalledWith("binding-menu");
 
-    const dispatcher = createFeishuReplyDispatcherMock.mock.results[0]?.value.dispatcher as {
-      sendFinalReply: ReturnType<typeof vi.fn>;
-    };
-    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not duplicate delivery when the first attempt fails after sending the reply", async () => {
-    const onMessage = await setupLifecycleMonitor();
-    const event = createTextEvent("om_lifecycle_retry");
-
-    dispatchReplyFromConfigMock.mockImplementationOnce(async ({ dispatcher }) => {
-      await dispatcher.sendFinalReply({ text: "reply once" });
-      throw new Error("post-send failure");
-    });
-
-    await onMessage(event);
-    await settleAsyncWork();
-    await onMessage(event);
-    await settleAsyncWork();
-
-    expect(lastRuntime?.error).toHaveBeenCalledTimes(1);
-    expect(dispatchReplyFromConfigMock).toHaveBeenCalledTimes(1);
     const dispatcher = createFeishuReplyDispatcherMock.mock.results[0]?.value.dispatcher as {
       sendFinalReply: ReturnType<typeof vi.fn>;
     };
